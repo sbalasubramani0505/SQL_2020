@@ -1,0 +1,380 @@
+SET hivevar:halfyearly=add_months(current_date,-6);
+SET hivevar:ninemonths=add_months(current_date,-9);
+SET hivevar:yearly=add_months(current_date,-12);
+SET hivevar:30days=add_months(current_date,-1);
+SET hivevar:60days=add_months(current_date,-2);
+set hivevar:curr_dt=2018-06-12;
+set hivevar:period=2018-06-11;
+set hivevar:interimDB=marketing_temp;
+set hivevar:marketingDB=marketing_temp;
+set hivevar:baseDB=base;
+set hivevar:tlcDB=tlc_enc;
+
+truncate table ${interimDB}.actor_attributes_stg;
+
+with multiple_loans_same_prod_inelig as
+(
+select tax_id, count(*)
+from ${baseDB}.credit_account_facility_detail cr_fac_det
+where period='${period}' and acct_status in ('ACTIVE')
+and product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016) 
+group by tax_id having count(*) > 1
+)
+insert into table ${interimDB}.actor_attributes_stg
+select distinct tax_id, null as aid, null as loan_id, 'N-PL' as repeat_loan_elig_flg, 'Existing Customer: Multiple Current loans - PL' as reason
+from multiple_loans_same_prod_inelig;
+
+with issued_amt_gt50K_inelig as
+(
+select tax_id, sum(curr_balance) tot_outstanding_amt
+from ${baseDB}.credit_account_facility_detail cr_fac_det
+where period='${period}' and acct_status in ('ACTIVE')
+and product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016)
+group by tax_id
+)
+insert into table ${interimDB}.actor_attributes_stg
+select distinct tax_id, null as aid, null as loan_id, 'N-PL' as repeat_loan_elig_flg, 'Existing Customer: Total loan amt - > 50K' as reason
+from issued_amt_gt50K_inelig where tot_outstanding_amt > 50000;
+
+with charged_off_cust as
+(
+select distinct tax_id
+from ${baseDB}.credit_account_facility_detail cr_fac_det
+where period='${period}' and acct_status in ('CHARGED_OFF')
+and product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016)
+)
+insert into table ${interimDB}.actor_attributes_stg
+select tax_id, null as aid, null as loan_id, 'N-PL' as repeat_loan_elig_flg, 'Existing Customer: Charged off in the past - PL' as reason
+from charged_off_cust;
+
+drop table if exists ${interimDB}.second_loan_elig_attributes;
+
+create table ${interimDB}.second_loan_elig_attributes as
+with loans_issued_gt6m as
+(
+select loan_id, borrower_uid, actor_ref_id, tax_id, issued_amt, issued_ts, curr_balance, loan_term,acct_status,delq_start_dt,
+number_of_payments_todate, remaining_loan_term,product_id
+from ${baseDB}.credit_account_facility_detail cr_fac_det 
+where period='${period}'  and issued_ts <= ${halfyearly}
+and product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016) 
+)
+select distinct cr_fac_det.loan_id, cr_fac_det.borrower_uid, cr_fac_det.actor_ref_id, cr_fac_det.tax_id, cr_fac_det.issued_amt, cr_fac_det.issued_ts, 
+cr_fac_det.curr_balance, cr_fac_det.loan_term,cr_fac_det.acct_status,cr_fac_det.delq_start_dt,
+cr_fac_det.number_of_payments_todate, cr_fac_det.remaining_loan_term,cr_fac_det.product_id , cr.credit_cr_fico,
+case when cr.credit_cr_fico >= 660 then 'Prime' else 'Non Prime' end as classification
+from loans_issued_gt6m cr_fac_det 
+left join ${baseDB}.credit_account_application_dim cr_app_dim on cr_fac_det.borrower_uid = cr_app_dim.borrower_party_uid
+left join ${baseDB}.credit_attributes cr on cr.credit_id = cr_app_dim.credit_id
+where cr_app_dim.current_flg=1;
+
+with inelig_tax_ids as
+(
+select * from ${interimDB}.actor_attributes_stg
+),
+other_elig as
+(
+select sec_attr.* from ${interimDB}.second_loan_elig_attributes sec_attr
+left join inelig_tax_ids inelig_tx on sec_attr.tax_id = inelig_tx.tax_id
+where inelig_tx.tax_id is null
+),
+second_loan_elig_population as
+(
+select tax_id,borrower_uid,loan_id,
+case when acct_status == 'CLOSED' then 'Y-Closed'
+     when (curr_balance/issued_amt > 0.5) and (issued_amt > 20000 or loan_term >=60) 
+     then case when (delq_start_dt is null or delq_start_dt < ${yearly} ) and (acct_status == 'ACTIVE') then 'Y-High Risk eligible'
+	  else 'N - High Risk ineligible' end
+else
+     case when classification == 'Prime' and (delq_start_dt is null or delq_start_dt < ${halfyearly} ) and (acct_status == 'ACTIVE') then 'Y- Prime'
+     when classification == 'Non Prime' and (delq_start_dt is null or delq_start_dt < ${ninemonths} ) and (acct_status == 'ACTIVE') then 'Y - Non Prime'
+   end 
+end as second_loan_elig
+from other_elig
+),
+elig_critera as
+(
+select distinct tax_id, borrower_uid, loan_id, case when second_loan_elig in ('Y- Prime','Y - Non Prime','Y-High Risk eligible','Y-Closed') then 'Y-PL'
+                         else 'N-PL' end as repeat_loan_elig_flg,
+case when second_loan_elig == 'Y- Prime' then 'Existing Customer: Prime loan and 6 consecutive payments'
+     when second_loan_elig == 'Y - Non Prime' then 'Existing Customer: Non prime loan and 9 consecutive payments'
+     when second_loan_elig == 'Y-High Risk eligible' then 'Existing Customer: High risk and 12 consecutive payments'
+     when second_loan_elig == 'Y-Closed' then 'Existing Customer: Closed'
+     when second_loan_elig == 'N - High Risk ineligible' then 'Existing Customer: High risk and no consecutive 12 payments'
+     else 'Existing Customer: Does not qualify repeat eligible' 
+end as reason
+from second_loan_elig_population
+)
+insert into ${interimDB}.actor_attributes_stg
+select distinct tax_id, borrower_uid, loan_id, repeat_loan_elig_flg, reason from
+elig_critera;
+
+drop table if exists ${interimDB}.prty_second_loan_eligible_stg;
+
+create table ${interimDB}.prty_second_loan_eligible_stg as 
+with cr_fac_filt as
+(
+select tax_id, borrower_uid,loan_id, acct_status
+from ${baseDB}.credit_account_facility_detail cr_fac_det 
+where period='${period}'
+and product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016)
+),
+prty_second_elig as
+(
+select * from ${interimDB}.actor_attributes_stg sec_elig
+where aid is not null
+),
+prty_second_elig_nullaid as
+(
+select * from ${interimDB}.actor_attributes_stg sec_elig
+where aid is null
+),
+second_loan_consol as
+(
+select distinct sec_elig.tax_id,sec_elig.aid, sec_elig.loan_id, sec_elig.repeat_loan_elig_flg, sec_elig.reason
+from prty_second_elig sec_elig
+union all
+select distinct cr_fac.tax_id,cr_fac.borrower_uid,cr_fac.loan_id,
+case when sec_elig.tax_id is not null then sec_elig.repeat_loan_elig_flg
+         when sec_elig.tax_id is null and sec_elig_aid.tax_id is null and cr_fac.acct_status != 'CLOSED' then 'N-PL' 
+         when cr_fac.acct_status == 'CLOSED' then 'Y-PL' end as repeat_loan_elig_flg,
+case when sec_elig.tax_id is not null then sec_elig.reason
+         when sec_elig.tax_id is null and sec_elig_aid.tax_id is null and cr_fac.acct_status != 'CLOSED' then 'Existing Customer: Other-Ineligible' 
+	 when cr_fac.acct_status == 'CLOSED' then 'Existing Customer: Closed'  end as reason
+from cr_fac_filt cr_fac
+left join prty_second_elig_nullaid sec_elig on cr_fac.tax_id=sec_elig.tax_id
+left join prty_second_elig sec_elig_aid on cr_fac.tax_id=sec_elig_aid.tax_id and cr_fac.borrower_uid=sec_elig_aid.aid
+)
+select tax_id, aid, loan_id, repeat_loan_elig_flg, reason,
+row_number() over (partition by aid order by repeat_loan_elig_flg asc) rn
+from second_loan_consol where repeat_loan_elig_flg is not null;
+
+insert overwrite table ${interimDB}.actor_attributes_stg
+select tax_id, aid, loan_id, repeat_loan_elig_flg, reason from ${interimDB}.prty_second_loan_eligible_stg where rn=1;
+
+drop table if exists ${interimDB}.cr_app_dim_elig;
+
+create table ${interimDB}.cr_app_dim_elig as
+with cr_app_dim as
+(
+select borrower_party_uid,credit_account_app_uid,status, create_ts,credit_id, cap.orig_dti5
+from ${baseDB}.credit_account_application_dim cap
+where cap.current_flg=1 and cap.product_id in (1,1001,1002,1004,1007,1012,2001,1015,1007,1012,1016) 
+),
+decln_reasons as (
+ select * from
+ (
+ select aa.id, aa.loan_id, aa.create_d, aarn.reason, aarn.reason_text , 
+ row_number() over (partition by aa.loan_id order by aa.create_d desc) rn
+						from ${tlcDB}.lc_aa aa
+						left join ${tlcDB}.lc_aa_reason aarn on (aa.id=aarn.aa_id)
+						--where aarn.reason != 0
+ )t1 where rn=1
+),						
+apps_dti_declines as
+(
+select  cr_app_dim.borrower_party_uid,cr_app_dim.credit_account_app_uid,cr_app_dim.status, cr_app_dim.create_ts, 
+aa.id as aa_id,aa.loan_id as aa_loan_id,aa.create_d as aa_create_d, aa.reason_text as decline_reason, c.id as credit_id, c.cr_dti,cr_app_dim.ORIG_DTI5
+from cr_app_dim
+left join decln_reasons aa on cr_app_dim.credit_account_app_uid = aa.loan_id
+left join ${tlcDB}.lc_credit c on cr_app_dim.credit_id=c.id
+),
+prty_dim_curr as
+(
+select prty_dim.party_uid,
+       prty_dim.tax_id,
+       prty_dim.clean_first_name, 
+       prty_dim.clean_last_name,
+       prty_dim.login_email,
+       prty_dim.clean_primary_addr_line_1,
+       prty_dim.primary_city_name,
+       prty_dim.primary_state_name,
+       prty_dim.primary_country_name,
+       prty_dim.primary_postal_code,
+       prty_dim.clean_primary_phone_number,
+       prty_dim.clean_restricted_ssn_enc
+       from ${baseDB}.party_dim prty_dim where current_flg=1 and src_system='lc10'
+),
+app_in_progress as (
+select prty_dim.tax_id,
+       cap.borrower_party_uid as aid,
+       cap.credit_account_app_uid as loan_id,
+       cap.status,
+       cap.create_ts,
+       cap.aa_id,
+       cap.aa_loan_id,
+       cap.aa_create_d,
+       cap.credit_id,
+       cap.cr_dti,
+       cap.orig_dti5,
+       cap.decline_reason,
+       case when cap.aa_create_d >= ${30days} then 'PL App: Declined for any reason in the last 30 days'
+        when (cap.cR_DTI >= 40 OR (ORIG_DTI5 >= 70 )) and cap.aa_create_d >= ${halfyearly} then 'PL App: Declined for DTI1 or High leverage in the last 6 months'
+        end as application_declined,
+       prty_dim.clean_first_name, 
+       prty_dim.clean_last_name,
+       prty_dim.login_email,
+       prty_dim.clean_primary_addr_line_1,
+       prty_dim.primary_city_name,
+       prty_dim.primary_state_name,
+       prty_dim.primary_country_name,
+       prty_dim.primary_postal_code,
+       prty_dim.clean_primary_phone_number,
+       prty_dim.clean_restricted_ssn_enc
+from apps_dti_declines cap
+ left outer join prty_dim_curr prty_dim on prty_dim.party_uid = cap.borrower_party_uid 
+), 
+sec_elig as
+(
+select * from ${interimDB}.actor_attributes_stg 
+),
+consol as
+(
+select app_in_progress.tax_id as app_tax_id, app_in_progress.aid as app_aid, app_in_progress.create_ts, app_in_progress.loan_id, status,app_in_progress.aa_id, app_in_progress.aa_loan_id, app_in_progress.aa_create_d, app_in_progress.credit_id, app_in_progress.cr_dti,app_in_progress.orig_dti5,app_in_progress.application_declined,sec_elig.tax_id,sec_elig.aid, sec_elig.repeat_loan_elig_flg as repeat_loan_elig_flg, sec_elig.reason as reason,
+app_in_progress.clean_first_name,
+       app_in_progress.clean_last_name,
+       app_in_progress.login_email,
+       app_in_progress.clean_primary_addr_line_1,
+       app_in_progress.primary_city_name,
+       app_in_progress.primary_state_name,
+       app_in_progress.primary_country_name,
+       app_in_progress.primary_postal_code,
+       app_in_progress.clean_primary_phone_number,
+       app_in_progress.clean_restricted_ssn_enc
+from app_in_progress 
+left join sec_elig on app_in_progress.aid=sec_elig.aid 
+),
+inelig_tax_id as
+(
+select distinct app_tax_id from consol where aid is null and create_ts >= ${60days}
+),
+app_consol as
+(
+select consol.app_tax_id, consol.app_aid, consol.loan_id,
+consol.clean_first_name,
+       consol.clean_last_name,
+       consol.login_email,
+       consol.clean_primary_addr_line_1,
+       consol.primary_city_name,
+       consol.primary_state_name,
+       consol.primary_country_name,
+       consol.primary_postal_code,
+       consol.clean_primary_phone_number,
+       consol.clean_restricted_ssn_enc,
+case when (inelig_tax_id.app_tax_id is not null or consol.application_declined is not null) then 'N-PL' 
+     else repeat_loan_elig_flg  end as pl_eligibility_flg,
+case when consol.application_declined is not null then consol.application_declined
+     when inelig_tax_id.app_tax_id is not null then 'PL App: - past 60 days' 
+     else consol.reason  end as reason,
+consol.application_declined
+from consol left join inelig_tax_id 
+on consol.app_tax_id=inelig_tax_id.app_tax_id
+union
+select consol.tax_id as app_tax_id, consol.aid as app_aid, consol.loan_id,
+consol.clean_first_name,
+       consol.clean_last_name,
+       consol.login_email,
+       consol.clean_primary_addr_line_1,
+       consol.primary_city_name,
+       consol.primary_state_name,
+       consol.primary_country_name,
+       consol.primary_postal_code,
+       consol.clean_primary_phone_number,
+       consol.clean_restricted_ssn_enc,
+consol.repeat_loan_elig_flg as pl_eligibility_flg, consol.reason,
+consol.application_declined
+from consol
+where app_tax_id is null
+)
+select distinct app_tax_id as tax_id, app_aid as aid,
+loan_id, 
+clean_first_name,
+clean_last_name,
+login_email,
+clean_primary_addr_line_1,
+primary_city_name,
+primary_state_name,
+primary_country_name,
+primary_postal_code,
+clean_primary_phone_number,
+clean_restricted_ssn_enc,
+pl_eligibility_flg as repeat_loan_elig_flg, reason as reason,
+application_declined
+from app_consol;
+
+drop table if exists ${interimDB}.actor_attributes_rollup_stg;
+
+create table ${interimDB}.actor_attributes_rollup_stg as
+select  tax_id, aid, loan_id, clean_first_name, clean_last_name, login_email, clean_primary_addr_line_1,
+primary_city_name, primary_state_name, primary_country_name, primary_postal_code, clean_primary_phone_number,
+repeat_loan_elig_flg, reason
+from ${interimDB}.cr_app_dim_elig where tax_id is not null;
+
+with chrgedoff_eliminate as
+(
+select distinct tax_id from 
+${baseDB}.credit_account_facility_detail
+where period='${period}' and acct_status in ('CHARGED_OFF','SUSPENDED')
+),
+pl_loans_issued_gt2m as
+(
+select loan_id, borrower_uid, actor_ref_id, cr_fac_det.tax_id, issued_amt, primary_state_name, issued_ts, curr_balance, loan_term,acct_status,delq_start_dt,
+number_of_payments_todate, remaining_loan_term,product_id
+from ${baseDB}.credit_account_facility_detail cr_fac_det
+left join chrgedoff_eliminate exclu on cr_fac_det.tax_id=exclu.tax_id
+where period='${period}'  and acct_status in ('ACTIVE','CLOSED') and issued_ts <= ${60days}
+and product_id=1004 and exclu.tax_id is null 
+),
+auto_elig as
+(
+select distinct cr_fac_det.loan_id, cr_fac_det.borrower_uid, cr_fac_det.actor_ref_id, cr_fac_det.tax_id, cr_fac_det.issued_amt, cr_fac_det.issued_ts,
+cr_fac_det.curr_balance, cr_fac_det.loan_term,cr_fac_det.acct_status,cr_fac_det.delq_start_dt,
+cr_fac_det.number_of_payments_todate, cr_fac_det.remaining_loan_term,cr_fac_det.product_id , cr.credit_cr_fico,
+cr.tu_au21s,stinfo.can_autorefi
+from pl_loans_issued_gt2m cr_fac_det
+left join ${baseDB}.credit_account_application_dim cr_app_dim on cr_fac_det.borrower_uid = cr_app_dim.borrower_party_uid
+left join ${baseDB}.credit_attributes cr on cr.credit_id = cr_app_dim.credit_id
+left join ${tlcDB}.lc_state_info stinfo on stinfo.state=cr_fac_det.primary_state_name
+where cr_app_dim.current_flg=1
+)
+insert into table ${interimDB}.actor_attributes_rollup_stg
+select tax_id, borrower_uid as aid, loan_id, 
+null as clean_first_name, null as clean_last_name,null as login_email,null as clean_primary_addr_line_1,null as primary_city_name, null as primary_state_name,null as primary_country_name, null as primary_postal_code, null as clean_primary_phone_number, 'Y-Auto' as repeat_loan_elig_flg, 'Existing Customer: Auto-Eligible' as reason
+from auto_elig where
+can_autorefi=1 and tu_au21s is not null;
+
+drop table if exists ${interimDB}.actor_attributes_rollup;
+
+create table ${interimDB}.actor_attributes_rollup as
+with cr_app_cust as
+(
+select rollup_stg.tax_id, rollup_stg.aid,rollup_stg.loan_id,rollup_stg.clean_first_name,rollup_stg.clean_last_name,rollup_stg.clean_primary_addr_line_1,
+rollup_stg.primary_city_name,rollup_stg.primary_state_name,rollup_stg.primary_country_name,rollup_stg.primary_postal_code,rollup_stg.clean_primary_phone_number,
+case when rollup_stg.reason == 'PL App: Declined for DTI1 or High leverage in the last 6 months' 
+and act_stg.tax_id is not null
+then null else rollup_stg.repeat_loan_elig_flg end  as repeat_loan_elig_flg,
+case when rollup_stg.reason == 'PL App: Declined for DTI1 or High leverage in the last 6 months' 
+and act_stg.tax_id is not null
+then null else rollup_stg.reason end  as reason
+from ${interimDB}.actor_attributes_rollup_stg rollup_stg
+left join ${interimDB}.actor_attributes_stg act_stg on rollup_stg.tax_id=act_stg.tax_id
+),
+other_elig as
+(
+select tax_id, collect_set(aid) as list_aid,collect_set(loan_id) as list_loanid, collect_set(clean_first_name) as list_first_name,
+collect_set(clean_last_name) as list_last_name,collect_set(clean_primary_addr_line_1) as list_address,
+collect_set(primary_city_name) as list_city,collect_set(primary_state_name) as list_state,collect_set(primary_country_name) as list_country,
+collect_set(primary_postal_code) as list_postalcode,collect_set(clean_primary_phone_number) as list_phonenumber,
+collect_set(repeat_loan_elig_flg) as consol_reason,collect_set(reason) as consol_reason_text
+from cr_app_cust
+group by tax_id
+),
+reason as
+(
+select tax_id, collect_set(repeat_loan_elig_flg) as consol_reason, collect_set(reason) as consol_reason_text
+from cr_app_cust
+where reason != 'Closed'
+group by tax_id
+)
+select other_elig.tax_id, list_loanid,case when reason.tax_id is not null then reason.consol_reason else other_elig.consol_reason end as reason, case when reason.tax_id is not null then reason.consol_reason_text else other_elig.consol_reason_text end as consol_reason_text,list_aid, list_first_name, list_last_name,list_address,list_city,list_state,list_country,list_postalcode,list_phonenumber
+from other_elig left join reason
+on other_elig.tax_id=reason.tax_id;
