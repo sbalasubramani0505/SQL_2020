@@ -1,0 +1,83 @@
+**
+We need help understanding our car sales business and we are relying on you to provide key insights into past performance. Please write the following queries to help us better understand our business.
+
+Tables:
+
+Sales: sale_id, vehicle_id, invoice_id, sale_dt, customer_id
+Vehicles: vehicle_id, vehicle_model_id, vehicle_year
+Vehicle_models: vehicle_model_id, model_name
+Customers: customer_id, customer_name
+Invoices: invoice_id, total_price
+**/
+
+
+-- Queries
+
+/**
+1. Report the list of customers who purchased a vehicle at least once in the last 3  years
+Include: customer name, total vehicles purchased
+Note: each customer should show up only once
+**/
+
+-- Write your SQL for Q1 below this line:
+
+select cust.customer_name, count(*) as total_vehicles_purchased
+from sales join customers cust 
+on (sales.customer_id=cust.customer_id)
+where year(sales.sale_dt) >= year(current_timestamp) - 3
+group by cust.customer_name;
+
+
+/**
+2. Create a report that lists the 2nd vehicle sold to customers who previously purchased their 1st, aggregate by vehicle model/year and sort by the most common 2nd vehicle sold.
+Include: model name, vehicle year, and units sold
+**/
+
+-- Write your SQL for Q2 below this line:
+
+/* select temp1.customer_id,vh.vehicle_model_id,
+vh_mdl.vehicle_model_id, */
+
+select vh_mdl.model_name,vh.vehicle_year,count(*) as units_sold
+from (select customer_id,vehicle_id,
+rank() over(partition by customer_id order by sale_dt asc) as rnk
+from sales 
+)temp1 join Vehicles vh 
+on (temp1.vehicle_id = vh.vehicle_id)  /* Second sale */
+left join vehicle_models vh_mdl 
+on (vh.vehicle_id = vh_mdl.vehicle_model_id)
+where temp1.rnk = 2 
+group by vh.vehicle_year,vh_mdl.model_name;
+
+
+/**
+3. Create a report of  time between 1st and 2nd vehicle sales
+Include: customer name, time difference in years
+**/
+
+-- Write your SQL for Q3 below this line:
+Sales: sale_id, vehicle_id, invoice_id, sale_dt, customer_id
+Customers: customer_id, customer_name
+
+with vehicle_sale_data as
+(
+select sales.sale_dt, cust.customer_name,rank() over (partition by sale_dt order by sale_dt asc) as rank
+from sales join customers cust on (sales.customer_id = cust.customer_id) 
+),
+first_sale as
+(
+select customer_name,sale_dt
+from vehicle_sale_data
+where rank = 1
+),
+second_sale as
+(
+select customer_name,sale_dt
+from vehicle_sale_data
+where rank = 2
+)
+select first_sale.customer_name, 
+case when second_sale.sale_dt is null then cast(null as date)
+  else year(first_sale.sale_dt) - year(second_sale.sale_dt) end as sale_year_diff
+from first_sale left join second_sale on (first_sale.customer_name=second_sale.customer_name);
+
